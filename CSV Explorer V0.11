@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+CSV Explorer V0.11.0
+
+Copyleft (ɔ) 2025 Diego Eguía Montiel - All Wrongs Reversed
+
+This program is free software under the GNU GPLv3.
+You are free to run it, read it, change it, and share it.
+If you improve it, just keep it free for the next person.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+
+See the GNU General Public License for more details:
+<https://www.gnu.org/licenses/>.
+
+Feature Release V0.11.0:
+• Added drill-down capability in crosstab mode
+• Select cells in crosstab to filter by both dimensions
+• Improved crosstab navigation with indexed rows/columns
+• Better integration between crosstab and exploration modes
+"""
+
+import pandas as pd
+import csv
+import sys
+import warnings
+import os
+from enum import Enum
+
+warnings.simplefilter(action="ignore", category=pd.errors.DtypeWarning)
+
+
+class NavigationAction(Enum):
+    """Defines the control flow states for the application."""
+    CONTINUE = "continue"
+    BACK = "back"
+
+
+class MenuDefs:
+    """Central registry for UI command strings and descriptions."""
+    LIST = "to list/select columns"
+    CROSS = "for cross-tab"
+    DRILL = "to drilldown"
+    BACK = "to go back"
+    RESET = "to reset filters"
+    FILTER = "to add filter"
+    TRANSPOSE = "to transpose"
+    PCT = "to toggle %"
+    QUIT = "to quit"
+    SELECT = "enter index number to select"
+
+    @classmethod
+    def get_dict(cls):
+        """Returns the dictionary mapping keys to descriptions."""
+        return {
+            "c": cls.LIST,
+            "f": cls.FILTER,
+            "x": cls.CROSS,
+            "d": cls.DRILL,
+            "r": cls.RESET,
+            "b": cls.BACK,
+            "t": cls.TRANSPOSE,
+            "%": cls.PCT,
+            "q": cls.QUIT,
+            "#": cls.SELECT 
+        }
+
+
+def get_user_choice(options: dict, header: str = "\nOptions:"):
+    """
+    Standard user input handler.
+    Displays key-based and numeric options, validates input,
+    and returns the selected command or index string.
+    """
+    if header:
+        print(header)
+
+    # Print <number> option first, if available
+    if "#" in options:
+        print(f"  • <number> {options['#']}")
+
+    # Print all other options (skip '#' as it's descriptive)
+    for key, desc in options.items():
+        if key != "#" and desc:
+            print(f"  • '{key}' {desc}")
+
+    while True:
+        choice = input("\nYour choice: ").strip().lower()
+        if choice in options:
+            return choice
+        # Allow comma-separated numbers if '#' is active
+        if "#" in options and all(part.strip().isdigit() for part in choice.split(",")):
+            return choice
+        print("Invalid option. Please enter a valid command.")
+
+
+class TableRenderer:
+    """Responsible for rendering DataFrames as ASCII pipe tables."""
+
+    @staticmethod
+    def render(data, title=None, highlight=None, force_pct=False, show_index=False, 
+               show_row_index=False, show_col_index=False):
+        """
+        Renders a pandas DataFrame to stdout with formatting and visual indexing.
+        
+        Args:
+            show_index: Shows row numbers for single column display
+            show_row_index: Shows row indices for crosstab (vertical)
+            show_col_index: Shows column indices for crosstab (horizontal)
+        """
+        if not isinstance(data, pd.DataFrame):
+            print("Error: TableRenderer requires a DataFrame.")
+            return
+
+        if title:
+            print(f"\n{title}")
+        print("=" * 60)
+        
+        # Truncate labels for display
+        index_labels = [str(x)[:25] + ("…" if len(str(x)) > 25 else "") for x in data.index]
+        col_labels = [str(x)[:25] + ("…" if len(str(x)) > 25 else "") for x in data.columns]
+        original_index = data.index
+        original_columns = data.columns
+        data.index, data.columns = index_labels, col_labels
+        
+        max_row_label = max(len(str(i)) for i in data.index)
+        col_widths = {c: max(len(str(c)), 8) for c in data.columns}
+        
+        # Header construction with column indices if requested
+        if show_col_index:
+            # Print column indices above headers
+            col_idx_line = "  "
+            if show_row_index:
+                col_idx_line += "     | "
+            col_idx_line += " " * max_row_label
+            for j, c in enumerate(data.columns):
+                if str(original_columns[j]) != "Total":
+                    col_idx_line += f" | [{j+1:^{col_widths[c]}}]"
+                else:
+                    col_idx_line += f" | {' ':^{col_widths[c]}}"
+            print(col_idx_line)
+        
+        # Main header
+        header = "  "
+        if show_index or show_row_index:
+            if show_row_index:
+                header += f"{'[#]':<5} | "
+            else:
+                header += f"{'#':<4} | "
+        header += f"{'VALUE':<{max_row_label}}"
+        for c in data.columns:
+            header += f" | {c:<{col_widths[c]}}"
+        print(header)
+        print("-" * len(header))
+        
+        # Row rendering
+        for i, idx in enumerate(data.index):
+            # Skip indexing for Total row
+            is_total_row = str(original_index[i]) == "Total"
+            
+            if is_total_row:
+                print("-" * len(header))
+            
+            row_line = "  "
+            if show_index or show_row_index:
+                if is_total_row:
+                    row_line += "      | " if show_row_index else "     | "
+                else:
+                    if show_row_index:
+                        row_line += f"[{i+1}]  | "
+                    else:
+                        row_line += f"{i+1:<4} | "
+
+            row_line += f"{idx:<{max_row_label}}"
+            
+            for c in data.columns:
+                val = data.iloc[i][c]
+                val_str = ""
+                if isinstance(val, float) and pd.notna(val):
+                    if force_pct or "%" in str(c) or c == "%":
+                        val_str = f"{val:.1f}%"
+                    elif val == int(val):
+                        val_str = str(int(val))
+                    else:
+                        val_str = f"{val:.1f}"
+                elif pd.notna(val):
+                    val_str = str(int(val))
+                
+                row_line += f" | {val_str:<{col_widths[c]}}"
+            print(row_line)
+        print("-" * len(header))
+        data.index = original_index
+        data.columns = original_columns
+
+
+class Dataset:
+    """
+    Model layer. Manages file I/O, lazy column loading, caching, 
+    and applying the filter stack.
+    """
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.delimiter = self._detect_delimiter()
+        self.columns = self._read_columns_only()
+        with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
+            self.row_count = sum(1 for _ in f) - 1
+        self.cache = {}
+        self.filter_stack = []
+        self.df_current = None
+
+    def _detect_delimiter(self):
+        """Attempts to deduce CSV delimiter."""
+        with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
+            sample = "".join([f.readline() for _ in range(10)])
+        try:
+            return csv.Sniffer().sniff(sample).delimiter
+        except Exception:
+            return ';' if sample.count(';') > sample.count(',') else ','
+
+    def _read_columns_only(self):
+        """Reads only headers to initialize column list."""
+        return pd.read_csv(
+            self.file_path, delimiter=self.delimiter, nrows=0, low_memory=False
+        ).columns.tolist()
+
+    def _load_needed_columns(self, col_names):
+        """Lazy loads specific columns into cache."""
+        missing = [c for c in col_names if c not in self.cache]
+        if missing:
+            df_new = pd.read_csv(
+                self.file_path, usecols=missing, delimiter=self.delimiter, low_memory=False
+            )
+            for c in missing:
+                self.cache[c] = df_new[c]
+        return pd.DataFrame({c: self.cache[c] for c in col_names})
+
+    def apply_filters(self):
+        """Re-evaluates the filter stack against the cached data."""
+        if not self.filter_stack:
+            self.df_current = None
+            return
+        cols_needed = list(set(c for c, _ in self.filter_stack))
+        df = self._load_needed_columns(cols_needed)
+        for col_name, values in self.filter_stack:
+            mask = pd.Series([False] * len(df), index=df.index)
+            for v in values:
+                if pd.isna(v):
+                    mask |= df[col_name].isna()
+                else:
+                    mask |= df[col_name].astype(str) == str(v)
+            df = df[mask]
+        self.df_current = df
+
+    def set_filter(self, col_name, vals):
+        """Replaces filter for a specific column."""
+        self.filter_stack = [(c, v) for c, v in self.filter_stack if c != col_name]
+        self.filter_stack.append((col_name, vals))
+        self.apply_filters()
+
+    def add_filter(self, col_name, vals):
+        """Adds a new filter to the stack."""
+        self.filter_stack.append((col_name, vals))
+        self.apply_filters()
+
+    def reset_filters(self):
+        """Clears all filters."""
+        self.filter_stack.clear()
+        self.df_current = None
+
+    def summarize_column(self, col_name):
+        """Generates value counts for a column based on current filters."""
+        total = self.row_count if self.df_current is None else len(self.df_current)
+        if total == 0:
+            return pd.DataFrame()
+
+        if self.df_current is not None:
+            if col_name in self.df_current.columns:
+                series = self.df_current[col_name]
+            else:
+                full_series = self._load_needed_columns([col_name])[col_name]
+                series = full_series.loc[self.df_current.index]
+        else:
+            series = self._load_needed_columns([col_name])[col_name]
+
+        vc = series.value_counts(dropna=False)
+        
+        df_vc = pd.DataFrame({
+            "COUNT": vc.values,
+            "%": (vc.values / total) * 100
+        }, index=vc.index)
+        
+        # Convert index to string to safely handle "Total" insertion later
+        df_vc.index = ["NaN" if pd.isna(i) else i for i in df_vc.index]
+        
+        # Logic Fix: Only add Total row if there is more than 1 row to summarize
+        if len(df_vc) > 1:
+            df_vc.loc["Total"] = [int(total), 100.0]
+            
+        df_vc["COUNT"] = df_vc["COUNT"].astype(int)
+        
+        return df_vc
+
+    def cross_tab(self, col1, col2, pct=False):
+        """Generates a cross-tabulation between two columns."""
+        df = self._load_needed_columns([col1, col2])
+        if self.df_current is not None:
+            df = df.loc[self.df_current.index]
+        if pct:
+            return pd.crosstab(df[col1], df[col2], margins=True, margins_name="Total", normalize='index').mul(100)
+        return pd.crosstab(df[col1], df[col2], margins=True, margins_name="Total")
+
+    def get_info(self):
+        """Returns metadata about the current dataset state."""
+        n = self.row_count if self.df_current is None else len(self.df_current)
+        return {
+            "rows_cur": n,
+            "rows_total": self.row_count,
+            "cols": len(self.columns),
+            "filters": self.filter_stack,
+        }
+
+
+class ExplorerSession:
+    """
+    Controller layer. Manages the user session, UI loops, and directs 
+    actions between the User and the Dataset.
+    """
+
+    def __init__(self, file_path):
+        self.data = Dataset(file_path)
+
+    def create_menu(self, keys, overrides=None):
+        """Builds a specific menu options dictionary."""
+        std = MenuDefs.get_dict()
+        opts = {}
+        for k in keys:
+            val = overrides.get(k, std.get(k, "")) if overrides else std.get(k, "")
+            if val: opts[k] = val
+        return opts
+
+    def display_status(self):
+        """Prints the current filter status and dataset size."""
+        info = self.data.get_info()
+        n, total = info["rows_cur"], info["rows_total"]
+        filters = info["filters"]
+        
+        print("\n" + "=" * 60)
+        if filters:
+            print("Current filters:")
+            for i, (c, vals) in enumerate(filters, 1):
+                j = ", ".join("NaN" if pd.isna(v) else str(v) for v in vals)
+                print(f"  {i}. {c} = {j}")
+        
+        print(f"\nFile: {self.data.file_path}")
+        print(f"Data: {n}/{total} rows ({n/total*100:.1f}%) | {info['cols']} cols")
+
+    def list_columns(self, select_mode=False, prompt_text="enter column index", return_on_select=True):
+        """
+        Interactive, paginated, searchable, and fully selectable column list.
+        """
+        cols = self.data.columns
+        if not cols:
+            print("\nNo columns found.")
+            return None
+
+        PAGE_SIZE = 50
+        page = 0
+        filtered = list(enumerate(cols))  # (absolute_index, name)
+        search_kw = None
+        current_select_mode = select_mode  # Allow toggling
+
+        while True:
+            total_pages = max(1, -(-len(filtered) // PAGE_SIZE))  # ceiling division
+            start = page * PAGE_SIZE
+            end = min(start + PAGE_SIZE, len(filtered))
+            subset = filtered[start:end]
+
+            print(f"\nColumns {start}-{end-1} of {len(filtered)} (page {page+1}/{total_pages})")
+            if search_kw:
+                print(f"Filter: '{search_kw}'")
+            
+            mode_str = "SELECT MODE" if current_select_mode else "VIEW MODE"
+            print(f"Mode: {mode_str}")
+            print("-" * 60)
+            
+            for abs_idx, name in subset:
+                print(f"{abs_idx}: {name}")
+            print("-" * 60)
+            
+            if current_select_mode:
+                print(f"Commands: <number>={prompt_text}, n=next, p=prev, s=switch to view mode")
+            else:
+                print("Commands: n=next, p=prev, s=switch to select mode")
+            print("         b=back, or type text to search")
+
+            raw = input("Your choice: ").strip()
+            if not raw:
+                continue
+
+            q = raw.lower()
+
+            # basic navigation
+            if q == "b":
+                return None
+            if q == "n":
+                page = (page + 1) % total_pages
+                continue
+            if q == "p":
+                page = (page - 1) % total_pages
+                continue
+            if q == "s":
+                current_select_mode = not current_select_mode
+                continue
+
+            # numeric selection (only in select mode)
+            if current_select_mode and raw.isdigit():
+                idx = int(raw)
+                if 0 <= idx < len(cols):
+                    if return_on_select:
+                        return idx  # Return immediately
+                    else:
+                        print(f"Selected: {cols[idx]}")
+                        continue
+                print(f"Index out of range (0–{len(cols)-1}).")
+                continue
+
+            # treat anything else as a search keyword
+            kw = raw.lower()
+            search_kw = kw
+            filtered = [(i, c) for i, c in enumerate(cols) if kw in c.lower()]
+            if not filtered:
+                print(f"No matches for '{kw}'. (resetting view)")
+                search_kw = None
+                filtered = list(enumerate(cols))
+            page = 0
+
+    def prompt_column_selection(self, prompt_text="Select column:", allow_list_select=True):
+        """
+        Helper to get a valid column index from the user.
+        """
+        cols = self.data.columns
+        opts = self.create_menu(['c', 'b', '#'], overrides={'#': prompt_text})
+        
+        while True:
+            choice = get_user_choice(opts, header="")
+            if choice == 'b': 
+                return None
+            if choice == 'c':
+                if allow_list_select:
+                    idx = self.list_columns(select_mode=True, prompt_text=prompt_text)
+                    if idx is not None:
+                        return idx
+                else:
+                    self.list_columns()
+                continue
+            
+            try:
+                idx = int(choice)
+                if 0 <= idx < len(cols):
+                    return idx
+                print(f"Index out of range (0-{len(cols)-1}).")
+            except ValueError:
+                print("Invalid input.")
+
+    def open_filter_modal(self):
+        """Starts the 'Modal Filter' workflow (Select Col -> Select Values)."""
+        print("\n--- Add Global Filter ---")
+        idx = self.prompt_column_selection("enter column number to filter by", allow_list_select=True)
+        if idx is not None:
+            self.explore_column(idx, select_only=True)
+
+    def explore_column(self, idx, select_only=False):
+        """
+        Main loop for exploring a single column's values.
+        """
+        cols = self.data.columns
+        if not (0 <= idx < len(cols)):
+            print("Invalid column index.")
+            return NavigationAction.CONTINUE
+        col = cols[idx]
+
+        while True:
+            vals = self.data.summarize_column(col)
+            active = next((v for c, v in self.data.filter_stack if c == col), None)
+            
+            if vals.empty:
+                print(f"\nNo data found in '{col}' with current filters.")
+                if select_only:
+                    input("Press Enter to cancel…")
+                    return NavigationAction.BACK
+                else:
+                    opts = self.create_menu(['b'], overrides={'b': "back"})
+                    get_user_choice(opts, header="No Data Options:")
+                    return NavigationAction.BACK
+
+            # UI Context Clarity
+            if select_only:
+                title = f"FILTERING: Select values to keep in '{col}'"
+            else:
+                title = f"EXPLORING: '{col}'"
+
+            TableRenderer.render(vals, title=title, highlight=active, show_index=True)
+            
+            # Dynamic Context Menus
+            if select_only:
+                opts = self.create_menu(['b', '#'], overrides={'b': "cancel", '#': "select value(s) to filter"})
+            else:
+                opts = self.create_menu(['x', 'd', 'c', 'b', '#'], overrides={'#': "select value(s) to filter"})
+            
+            cmd = get_user_choice(opts)
+            
+            if cmd == "b": return NavigationAction.BACK
+            
+            # Non-Modal commands
+            if not select_only:
+                if cmd == "x": 
+                    self.cross_tabulate(idx)
+                    continue
+                if cmd == "c": 
+                    new_idx = self.list_columns(select_mode=True, prompt_text="select column to explore")
+                    if new_idx is not None:
+                        return self.explore_column(new_idx)
+                    continue
+                if cmd == "d":
+                    new_idx = self.prompt_column_selection("enter column number to drilldown", allow_list_select=True)
+                    if new_idx is not None:
+                        if self.explore_column(new_idx) == NavigationAction.BACK:
+                            continue
+                    continue
+
+            # Selection Logic (Used in both modes)
+            try:
+                nums = [int(x.strip()) for x in cmd.split(",") if x.strip()]
+                
+                limit = len(vals) - 1 if "Total" in vals.index else len(vals)
+                
+                if any(n < 1 or n > limit for n in nums):
+                    print(f"Invalid selection. Choose 1-{limit}.")
+                    continue
+                
+                sel_indices = [vals.index[n - 1] for n in nums]
+                
+                if select_only:
+                    self.data.add_filter(col, sel_indices)
+                    return NavigationAction.BACK
+                else:
+                    self.data.set_filter(col, sel_indices)
+            except ValueError:
+                print("Invalid input.")
+
+    def cross_tabulate(self, base_col_idx):
+        """Handles the cross-tabulation view loop with drill-down capability."""
+        cols = self.data.columns
+        base = cols[base_col_idx]
+        
+        print(f"\nSelect target column to cross-tab with '{base}':")
+        target_idx = self.prompt_column_selection(f"cross-tab '{base}' with (col index)", allow_list_select=True)
+        
+        if target_idx is None:
+            return NavigationAction.BACK
+
+        show_pct = False
+        transposed = False
+
+        if not (0 <= target_idx < len(cols)):
+            print("Invalid index.")
+            return NavigationAction.CONTINUE
+        target = cols[target_idx]
+        
+        while True:
+            cf = self.data.cross_tab(base, target, pct=show_pct)
+            if transposed: cf = cf.T
+            
+            t_type = ("Row %" if show_pct else "Count") + (" [T]" if transposed else "")
+            
+            # Show indices for drill-down capability
+            TableRenderer.render(cf, title=f"Cross-Tab ({t_type}): {base} vs {target}", 
+                               force_pct=show_pct, show_row_index=True, show_col_index=True)
+            
+            # Enhanced menu with drill-down option
+            view_opts = self.create_menu(['d', '%', 't', 'b', '#'], overrides={
+                'd': "to drill-down on a cell",
+                '#': "enter row,col indices to drill-down (e.g., 2,3)",
+                'b': "back to exploring"
+            })
+            cmd = get_user_choice(view_opts, header="\nView Options:")
+            
+            if cmd == 'b': break
+            if cmd == '%': show_pct = not show_pct; continue
+            if cmd == 't': transposed = not transposed; continue
+            
+            # Handle drill-down
+            if cmd == 'd' or ',' in cmd or cmd.isdigit():
+                # Parse input for drill-down
+                if cmd == 'd':
+                    drill_input = input("Enter row,column indices (e.g., 2,3): ").strip()
+                else:
+                    drill_input = cmd
+                
+                try:
+                    parts = drill_input.split(',')
+                    if len(parts) == 2:
+                        row_idx = int(parts[0].strip()) - 1
+                        col_idx = int(parts[1].strip()) - 1
+                        
+                        # Get actual values (accounting for transposition)
+                        if transposed:
+                            actual_cf = cf.T
+                        else:
+                            actual_cf = cf
+                        
+                        # Validate indices (exclude Total row/column)
+                        max_row = len(actual_cf.index) - 1  # -1 for Total row
+                        max_col = len(actual_cf.columns) - 1  # -1 for Total column
+                        
+                        if 0 <= row_idx < max_row and 0 <= col_idx < max_col:
+                            row_val = actual_cf.index[row_idx]
+                            col_val = actual_cf.columns[col_idx]
+                            
+                            # Apply filters for the drill-down
+                            print(f"\nDrilling down: {base}='{row_val}', {target}='{col_val}'")
+                            
+                            # Store current filters
+                            prev_filters = self.data.filter_stack.copy()
+                            
+                            # Add drill-down filters
+                            self.data.add_filter(base, [row_val])
+                            self.data.add_filter(target, [col_val])
+                            
+                            # Let user explore the filtered data
+                            print("\n--- Drill-Down View ---")
+                            self.drill_down_explore()
+                            
+                            # Restore previous filters
+                            self.data.filter_stack = prev_filters
+                            self.data.apply_filters()
+                            print("\nReturned to cross-tab view.")
+                        else:
+                            print(f"Invalid indices. Row: 1-{max_row}, Column: 1-{max_col}")
+                    else:
+                        print("Please enter exactly two numbers separated by comma (row,col)")
+                except ValueError:
+                    print("Invalid input format. Use: row,column (e.g., 2,3)")
+        
+        return NavigationAction.CONTINUE
+
+    def drill_down_explore(self):
+        """
+        Mini exploration loop for drill-down data.
+        Shows filtered dataset info and allows basic exploration.
+        """
+        while True:
+            self.display_status()
+            
+            # Limited menu for drill-down exploration
+            keys = ['c', 'b', '#']
+            overrides = {
+                'b': "to return to cross-tab",
+                '#': "enter column index to explore",
+                'c': "to list/select columns"
+            }
+            
+            opts = self.create_menu(keys, overrides)
+            choice = get_user_choice(opts)
+
+            if choice == "b": 
+                return
+            if choice == "c": 
+                idx = self.list_columns(select_mode=True, prompt_text="select column to explore")
+                if idx is not None:
+                    # Simplified explore without modifying filters
+                    self.view_column_values(idx)
+                continue
+            
+            try:
+                idx = int(choice)
+                if 0 <= idx < len(self.data.columns):
+                    self.view_column_values(idx)
+                else:
+                    print(f"Index out of range (0-{len(self.data.columns)-1}).")
+            except ValueError:
+                print("Invalid option.")
+
+    def view_column_values(self, idx):
+        """
+        Simple column viewer for drill-down mode.
+        Shows values without allowing filter changes.
+        """
+        cols = self.data.columns
+        if not (0 <= idx < len(cols)):
+            print("Invalid column index.")
+            return
+        
+        col = cols[idx]
+        vals = self.data.summarize_column(col)
+        
+        if vals.empty:
+            print(f"\nNo data found in '{col}' with current filters.")
+            input("Press Enter to continue…")
+            return
+        
+        TableRenderer.render(vals, title=f"Drill-Down View: '{col}'", show_index=True)
+        
+        # Simple menu - just viewing
+        opts = {'b': "to go back"}
+        get_user_choice(opts)
+
+    def run(self):
+        """Main event loop for the file session."""
+        while True:
+            self.display_status()
+            
+            keys = ['c', 'f', 'b', '#']
+            if self.data.filter_stack: keys.append('r')
+            
+            overrides = {
+                'b': "to go back to file selection",
+                '#': "enter column index to explore",
+                'c': "to list/select columns"
+            }
+            
+            opts = self.create_menu(keys, overrides)
+            choice = get_user_choice(opts)
+
+            if choice == "b": return NavigationAction.BACK
+            if choice == "r": self.data.reset_filters(); continue
+            if choice == "f": self.open_filter_modal(); continue
+            if choice == "c": 
+                idx = self.list_columns(select_mode=True, prompt_text="select column to explore")
+                if idx is not None:
+                    self.explore_column(idx)
+                continue
+            
+            if "," in choice:
+                print("Please select only one column to explore.")
+                continue
+
+            try:
+                self.explore_column(int(choice))
+            except ValueError:
+                print("Invalid option.")
+
+
+def get_csv_files():
+    """Scans current directory for CSV files."""
+    files = []
+    for f in os.listdir("."):
+        if f.lower().endswith(".csv"):
+            size = os.path.getsize(f)
+            s = f"{size} B" if size < 1024 else f"{size/1024:.1f} KB"
+            if size > 1024**2: s = f"{size/(1024**2):.1f} MB"
+            files.append((f, s))
+    files.sort()
+    return files
+
+
+def main():
+    """Application Entry Point."""
+    print("CSV Explorer V0.11.0")
+    print("=" * 60)
+    while True:
+        files = get_csv_files()
+        if not files:
+            print("\nNo CSV files found.")
+            break
+            
+        print("\nCSV files found:")
+        for i, (f, s) in enumerate(files):
+            print(f"{i+1}: {f} ({s})")
+        opts = {'#': f"select file (1-{len(files)})", 'q': MenuDefs.QUIT}
+        ch = get_user_choice(opts, header="\nOptions:") 
+        
+        if ch == "q": 
+            print("\nGoodbye! 👋\n"); break
+            
+        try:
+            fpath = files[int(ch)-1][0]
+            print(f"\nSUCCESS! Now exploring {fpath}…")
+            session = ExplorerSession(fpath)
+            session.run()
+        except (ValueError, IndexError):
+            print("Invalid selection.")
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nGoodbye! 👋\n")
+        sys.exit(0)
