@@ -19,9 +19,9 @@ CSV Explorer is an interactive command-line tool for exploring and analyzing CSV
 ## Usage Guide
 
 ### 1. Launching the Tool
-Run the script directly:
+Run the script directly (active virtual environment recommended):
 ```
-python csv_explorer.py
+python3 csv_explorer.py
 ```
 
 ### 2. File Selection
